@@ -293,6 +293,73 @@
       }
     }
   },
+  "forward_personas": {
+    "description": "合并转发人物",
+    "type": "object",
+    "hint": "开启后，合并转发里会有三个「人物」分别用 AI 总结本次更新的不同方面。需先开启「使用合并转发推送」，并配置可用的 LLM 提供商",
+    "items": {
+      "forward_persona_enable": {
+        "description": "启用人物总结节点",
+        "type": "bool",
+        "default": false,
+        "hint": "合并转发里在概览节点之后插入三个由 LLM 生成的人物节点；模型不可用时自动跳过，不影响原文节点推送"
+      },
+      "forward_persona_1_name": {
+        "description": "人物1 昵称",
+        "type": "string",
+        "default": "情报员",
+        "hint": "显示为合并转发节点的发送者昵称；留空表示不启用该人物"
+      },
+      "forward_persona_1_uin": {
+        "description": "人物1 QQ号",
+        "type": "string",
+        "default": "",
+        "hint": "留空则回落到机器人自身 uin（三个人物头像相同）；填真实 QQ 号才会显示该号的头像"
+      },
+      "forward_persona_1_prompt": {
+        "description": "人物1 提示词",
+        "type": "text",
+        "default": "你是一名游戏情报员，负责把版本更新的干货讲清楚。用简洁直白的中文说明这次更新【改了什么】：新增了什么功能、调整了哪些机制、修了哪些问题。按重要性排序，只讲事实，不做评价。",
+        "hint": "决定该人物总结公告的哪个方面；留空使用内置默认提示词"
+      },
+      "forward_persona_2_name": {
+        "description": "人物2 昵称",
+        "type": "string",
+        "default": "分析师",
+        "hint": "显示为合并转发节点的发送者昵称；留空表示不启用该人物"
+      },
+      "forward_persona_2_uin": {
+        "description": "人物2 QQ号",
+        "type": "string",
+        "default": "",
+        "hint": "留空则回落到机器人自身 uin（三个人物头像相同）；填真实 QQ 号才会显示该号的头像"
+      },
+      "forward_persona_2_prompt": {
+        "description": "人物2 提示词",
+        "type": "text",
+        "default": "你是一名游戏分析师，负责解读更新带来的影响。基于本次更新内容，说明【对玩法、平衡性和玩家体验的影响】：哪些流派/武器/角色被加强或削弱，哪些改动会改变当前的打法，玩家上线后需要特别注意什么。",
+        "hint": "决定该人物总结公告的哪个方面；留空使用内置默认提示词"
+      },
+      "forward_persona_3_name": {
+        "description": "人物3 昵称",
+        "type": "string",
+        "default": "吐槽君",
+        "hint": "显示为合并转发节点的发送者昵称；留空表示不启用该人物"
+      },
+      "forward_persona_3_uin": {
+        "description": "人物3 QQ号",
+        "type": "string",
+        "default": "",
+        "hint": "留空则回落到机器人自身 uin（三个人物头像相同）；填真实 QQ 号才会显示该号的头像"
+      },
+      "forward_persona_3_prompt": {
+        "description": "人物3 提示词",
+        "type": "text",
+        "default": "你是群里最爱吐槽的老玩家，负责给这次更新来一段【一句话锐评】。用轻松幽默、口语化的中文，可以调侃最离谱的改动、点出最值得期待的亮点，带一点网络梗，但不要造谣、不要攻击开发者。",
+        "hint": "决定该人物总结公告的哪个方面；留空使用内置默认提示词"
+      }
+    }
+  },
   "rendering_and_performance": {
     "description": "渲染与性能",
     "type": "object",

@@ -64,6 +64,35 @@ OFFICIAL_NEWS_LABEL = "Community Announcements"
 EXTERNAL_NEWS_PATH_MARKER = "/news/externalpost/"
 # 合并转发中概览节点的发送者昵称
 FORWARD_SENDER_NAME = "Steam 更新推送"
+# 人物总结：投喂给模型的更新摘要上限（字符）
+PERSONA_DIGEST_MAX_CHARS = 6000
+# 人物总结：每个节点的正文上限（字符）
+PERSONA_TEXT_MAX_CHARS = 600
+# 人物总结：摘要里每个分区最多列出多少条更新
+PERSONA_SECTION_MAX_ITEMS = 8
+# 人物总结的默认提示词（WebUI 留空时使用）
+DEFAULT_PERSONA_PROMPTS = (
+    # 1 速览
+    "你是一名游戏情报员，负责把版本更新的干货讲清楚。用简洁直白的中文说明这次更新【改了什么】："
+    "新增了什么功能、调整了哪些机制、修了哪些问题。按重要性排序，只讲事实，不做评价。",
+    # 2 影响
+    "你是一名游戏分析师，负责解读更新带来的影响。基于本次更新内容，说明【对玩法、平衡性和玩家体验的影响】："
+    "哪些流派/武器/角色被加强或削弱，哪些改动会改变当前的打法，玩家上线后需要特别注意什么。",
+    # 3 锐评
+    "你是群里最爱吐槽的老玩家，负责给这次更新来一段【一句话锐评】。用轻松幽默、口语化的中文，"
+    "可以调侃最离谱的改动、点出最值得期待的亮点，带一点网络梗，但不要造谣、不要攻击开发者。",
+)
+# 人物总结的提示词外壳
+PERSONA_PROMPT_TEMPLATE = """{persona}
+
+【本次 Steam 更新内容】
+{digest}
+
+【输出要求】
+- 直接输出你要发在群里的话，不要标题、不要前后缀、不要复述本条要求
+- 200 字以内，可以用简短换行分点
+- 只依据上面的内容，不要编造没有提到的改动
+"""
 MAX_NEWS_IMAGE_BYTES = 4_000_000
 MAX_NEWS_IMAGE_PIXELS = 3_500_000
 MAX_NEWS_IMAGE_CACHE_FILES = 400
@@ -127,6 +156,7 @@ class SteamUpdatePush(Star):
         "polling_settings",
         "network_proxy",
         "content_processing",
+        "forward_personas",
         "rendering_and_performance",
         "debug_settings",
     )
@@ -159,6 +189,7 @@ class SteamUpdatePush(Star):
         self._trace_seq = 0
         self._image_fail_until: dict[str, float] = {}
         self._header_fail_until: dict[str, float] = {}
+        self._persona_cache: dict[str, list[tuple[str, str, str]]] = {}
         self._last_workshop_url_network_error = False
         self._poll_lock_path = self._data_dir / ".poll.lock"
         self._poll_lock_fd: int | None = None
@@ -791,6 +822,31 @@ class SteamUpdatePush(Star):
     def _forward_node_include_image(self) -> bool:
         return bool(self._cfg("forward_node_include_image", True))
 
+    def _forward_persona_enabled(self) -> bool:
+        return bool(self._cfg("forward_persona_enable", False))
+
+    def _forward_personas(self) -> list[tuple[str, str, str]]:
+        """读取三个人物：(昵称, QQ号, 提示词)。昵称为空则跳过该人物。"""
+        personas: list[tuple[str, str, str]] = []
+        for index in (1, 2, 3):
+            name = str(self._cfg(f"forward_persona_{index}_name", "") or "").strip()
+            if not name:
+                continue
+            uin = str(self._cfg(f"forward_persona_{index}_uin", "") or "").strip()
+            if uin and not uin.isdigit():
+                self._log_warn(
+                    "push",
+                    "invalid persona uin, fallback to bot uin",
+                    index=index,
+                    uin=uin,
+                )
+                uin = ""
+            prompt = str(self._cfg(f"forward_persona_{index}_prompt", "") or "").strip()
+            if not prompt:
+                prompt = DEFAULT_PERSONA_PROMPTS[index - 1]
+            personas.append((name, uin, prompt))
+        return personas
+
     def _failed_download_cooldown_sec(self) -> int:
         try:
             n = int(self._cfg("failed_download_cooldown_sec", 1800))
@@ -1289,6 +1345,7 @@ class SteamUpdatePush(Star):
                     publish_text,
                     query_text,
                     card_kind,
+                    forward_targets[0].umo,
                 )
                 forwarded = forward_result.succeeded
                 targets = forward_result.failed
@@ -3432,6 +3489,10 @@ class SteamUpdatePush(Star):
         except Exception as exc:
             self._debug(f"llm request failed: {exc}")
             return None
+        if resp is None:
+            # 部分提供商在失败时直接返回 None；不能让它变成字符串 "None"
+            self._log_warn("llm", "empty response", provider_id=provider_id)
+            return None
         text = ""
         try:
             if hasattr(resp, "completion_text"):
@@ -3663,6 +3724,117 @@ class SteamUpdatePush(Star):
         return "\n".join(lines).strip()
 
     # --- merge forward (OneBot v11) ---
+    def _build_persona_digest(
+        self,
+        sections: list[AppSection],
+        publish_text: str,
+    ) -> str:
+        """把本批次更新压缩成给人物总结用的摘要。
+
+        预算按分区均分，避免排在前面的游戏把后面的分区整个挤出摘要。
+        """
+        if not sections:
+            return ""
+        section_budget = max(400, PERSONA_DIGEST_MAX_CHARS // len(sections))
+        blocks: list[str] = []
+        for sec in sections:
+            items = list(sec.updates)[:PERSONA_SECTION_MAX_ITEMS]
+            per_item = max(120, section_budget // max(1, len(items)))
+            lines: list[str] = [f"【{sec.title}】"]
+            if not items:
+                lines.append("暂无更新")
+            for item in items:
+                if item.title:
+                    lines.append(f"标题：{item.title}")
+                body = self._summarize_text(item.contents, per_item)
+                if body:
+                    lines.append(body)
+            if len(sec.updates) > len(items):
+                lines.append(f"（另有 {len(sec.updates) - len(items)} 条未列出）")
+            block = "\n".join(lines).strip()
+            if len(block) > section_budget:
+                block = block[: section_budget - 3].rstrip() + "..."
+            blocks.append(block)
+        digest = f"发布时间：{publish_text}\n\n" + "\n\n".join(blocks)
+        if len(digest) > PERSONA_DIGEST_MAX_CHARS:
+            digest = digest[: PERSONA_DIGEST_MAX_CHARS - 3].rstrip() + "..."
+        return digest
+
+    async def _build_persona_nodes(
+        self,
+        sections: list[AppSection],
+        publish_text: str,
+        umo: str | None = None,
+    ) -> list[Node]:
+        """让三个人物分别用 LLM 总结本次更新的不同方面，各占一个节点。"""
+        if not sections or not self._forward_persona_enabled():
+            return []
+        personas = self._forward_personas()
+        if not personas:
+            return []
+        digest = self._build_persona_digest(sections, publish_text)
+        if not digest:
+            return []
+
+        signature = "|".join(f"{name}\x00{uin}\x00{prompt}" for name, uin, prompt in personas)
+        cache_key = hashlib.sha1(
+            f"{signature}\x00{digest}".encode("utf-8", errors="ignore")
+        ).hexdigest()
+        cached = self._persona_cache.get(cache_key)
+        if cached is not None:
+            self._log_debug("push", "persona cache hit", node_count=len(cached))
+            return [
+                Node(content=[Plain(text)], name=name, uin=uin or "0")
+                for name, uin, text in cached
+            ]
+
+        template = PERSONA_PROMPT_TEMPLATE
+
+        async def render(persona: tuple[str, str, str]) -> tuple[str, str, str] | None:
+            name, uin, prompt = persona
+            text = await self._call_llm(
+                template.replace("{persona}", prompt).replace("{digest}", digest),
+                umo,
+            )
+            if not text or not text.strip():
+                return None
+            text = text.strip()
+            if len(text) > PERSONA_TEXT_MAX_CHARS:
+                text = text[: PERSONA_TEXT_MAX_CHARS - 3].rstrip() + "..."
+            return (name, uin, text)
+
+        results = await asyncio.gather(
+            *(render(persona) for persona in personas),
+            return_exceptions=True,
+        )
+        entries: list[tuple[str, str, str]] = []
+        for result in results:
+            if isinstance(result, BaseException):
+                if isinstance(result, asyncio.CancelledError):
+                    raise result
+                self._log_warn(
+                    "push",
+                    "persona generate failed",
+                    error_type=type(result).__name__,
+                )
+                continue
+            if result is None:
+                continue
+            entries.append(result)
+
+        self._persona_cache[cache_key] = entries
+        if len(self._persona_cache) > 8:
+            for key in list(self._persona_cache)[:-8]:
+                self._persona_cache.pop(key, None)
+        if not entries:
+            self._log_warn("push", "persona nodes empty, llm unavailable?")
+            return []
+        self._log_debug("push", "persona nodes built", node_count=len(entries))
+        return [
+            Node(content=[Plain(text)], name=name, uin=uin or "0")
+            for name, uin, text in entries
+        ]
+
     async def _forward_node_image_path(
         self,
         section: AppSection,
@@ -3691,6 +3863,7 @@ class SteamUpdatePush(Star):
         publish_text: str,
         query_text: str,
         card_kind: str = "game",
+        umo: str | None = None,
     ) -> MessageChain | None:
         """把一个批次渲染成 OneBot v11 合并转发（一个分区一个节点）。"""
         if not sections:
@@ -3726,6 +3899,8 @@ class SteamUpdatePush(Star):
                 uin="0",
             )
         ]
+        # 三个人物节点：分别总结本次更新的不同方面
+        nodes.extend(await self._build_persona_nodes(sections, publish_text, umo))
         for sec in sections:
             body = "\n".join(self._section_body_lines(sec, max_chars)).strip() or "暂无更新"
             node_content: list[Any] = [Plain(body)]
@@ -4766,12 +4941,14 @@ class SteamUpdatePush(Star):
         publish_text: str,
         query_text: str,
         card_kind: str,
+        umo: str | None = None,
     ) -> PushResult:
         chain = await self._build_forward_chain(
             sections,
             publish_text,
             query_text,
             card_kind,
+            umo,
         )
         if chain is None:
             return PushResult([], list(targets))

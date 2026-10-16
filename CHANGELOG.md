@@ -7,9 +7,13 @@
 ### 新增
 - 合并转发推送：新增 `forward_message_enable`，开启后更新以 OneBot v11 合并转发（`send_group_forward_msg` / `send_private_forward_msg`）推送。第 1 个节点是概览（发布时间、查询时间、各分区条数），之后每个游戏 / 创意工坊 / 限时免费分区各占一个节点，节点昵称使用分区标题
 - 新增 `forward_node_include_image`：控制合并转发的节点是否附带该分区的首张可用图片（默认开启）
+- 合并转发人物节点：新增 `forward_persona_enable` 及三组人物配置（`forward_persona_N_name` / `_uin` / `_prompt`）。开启后，合并转发会在概览节点之后插入三个由 LLM 生成的人物节点，分别总结本次更新的不同方面（默认：情报员=改了什么 / 分析师=影响与平衡 / 吐槽君=一句话锐评）。人物昵称与 QQ 号可配，QQ 号留空则回落到机器人自身 uin
+- 人物节点使用独立的提示词外壳与摘要生成：摘要预算按分区均分（每个分区最多 8 条、总上限 6000 字符），确保靠后的游戏不会被前面的刷掉；同一批次的三个请求并发执行，并按摘要哈希缓存，避免多推送目标重复调用模型
+- 人物昵称可作为占位名先填，头像由 QQ 号决定：填真实的三个号才会显示三张不同头像，留空则三个节点共用机器人头像
 - 适配 SnowLuma：确认其 `send_group_forward_msg` / `send_private_forward_msg` 接受 AstrBot 生成的标准 node 结构（`{"type":"node","data":{"user_id","nickname","content"}}`），且协议端对 `user_id=0` 会回落到机器人自身 uin。非 OneBot v11 平台（telegram / discord / QQ 官方 API 等）自动回退为普通卡片或文本，合并转发被拒绝时也会自动补发普通消息
 
 ### 修复
+- LLM 空响应：`_call_llm` 在提供商返回 `None`（部分提供商失败时如此）时会走 `str(resp)` 分支，把字面量字符串 `"None"` 当成模型输出；现在明确返回 `None` 并记录告警
 - HTTP 客户端初始化竞态：`_fetch_news` 在客户端尚未建立时直接返回空列表，且并发的 `_ensure_http_client` 会各自新建客户端并 `aclose` 掉对方的在途请求。现在 `_fetch_news` 自行确保客户端就绪，客户端创建改为加锁的双重检查
 - 游戏公告过滤：Steam 现在会把包括开发者公告在内的几乎所有新闻都标记为 `is_external_url=true`，旧逻辑按该字段过滤会导致官方公告被整批丢弃（实测 CS2/Dota2 最近 50 条公告存活数为 0）。改为按发布渠道（`feed_type` / `feedname` / `feedlabel` / 链接中的 `externalpost` 来源名）判定，无法判定时保留
 - 创意工坊摘要：`ISteamRemoteStorage/GetPublishedFileDetails` 返回的字段名是 `description`，旧代码读取的 `file_description` 不存在，导致摘要恒为空；同时该摘要此前只写进了一个未被使用的局部变量，现在会真正渲染进卡片
