@@ -12,7 +12,7 @@ import re
 import time
 import uuid
 from email.utils import parsedate_to_datetime
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -49,6 +49,19 @@ STEAM_IMAGE_DOMAINS = {
     "steamusercontent.com",
     "akamaihd.net",
 }
+# Steam 官方发布渠道的 feedname（小写 slug）。其余来源视为第三方媒体转载。
+OFFICIAL_NEWS_FEEDS = frozenset(
+    {
+        "steam_community_announcements",  # 开发者/发行商公告（API 中 feed_type=1）
+        "steam_updates",  # Valve 产品更新
+    }
+)
+# Valve 各游戏官方博客，如 tf2_blog / dota2_blog / l4d_blog
+OFFICIAL_NEWS_FEED_SUFFIX = "_blog"
+# 官方公告使用的 feedlabel
+OFFICIAL_NEWS_LABEL = "Community Announcements"
+# 第三方媒体转载在 URL 中的路径标记
+EXTERNAL_NEWS_PATH_MARKER = "/news/externalpost/"
 MAX_NEWS_IMAGE_BYTES = 4_000_000
 MAX_NEWS_IMAGE_PIXELS = 3_500_000
 MAX_NEWS_IMAGE_CACHE_FILES = 400
@@ -1844,7 +1857,9 @@ class SteamUpdatePush(Star):
             return False
         end_ts = self._parse_free_game_datetime(entry.get("end_date"))
         if end_ts <= 0:
-            return False
+            # GamerPower 用 "N/A" 表示没有明确截止时间（长期有效）。
+            # 此时以接口的 status 为准，避免把长期活动误判为已结束。
+            return status == "active"
         current_ts = int(now_ts if now_ts is not None else time.time())
         return end_ts > current_ts
 
@@ -1869,7 +1884,15 @@ class SteamUpdatePush(Star):
         published_ts = self._parse_free_game_datetime(entry.get("published_date"))
         end_ts = self._parse_free_game_datetime(entry.get("end_date"))
         appid = str(appid or self._extract_free_game_appid(entry)).strip()
-        end_text = self._format_free_game_time(end_ts) if end_ts else (str(entry.get("end_date") or "").strip() or "未知")
+        if end_ts:
+            end_text = self._format_free_game_time(end_ts)
+        else:
+            raw_end = str(entry.get("end_date") or "").strip()
+            end_text = (
+                "长期有效"
+                if raw_end.lower() in {"", "n/a", "null", "none"}
+                else raw_end
+            )
         worth = str(entry.get("worth") or "").strip() or "未知"
         lines = [
             f"截止时间: {end_text}",
@@ -2314,11 +2337,21 @@ class SteamUpdatePush(Star):
             return ""
         return self._parse_steamcommunity_author_path(m.group("path"))
 
-    def _build_workshop_content(self, workshop_id: str, author: str, ts: int, change_text: str) -> str:
+    def _build_workshop_content(
+        self,
+        workshop_id: str,
+        author: str,
+        ts: int,
+        change_text: str,
+        summary: str = "",
+    ) -> str:
         lines = [f"ID: {workshop_id}"]
         if author:
             lines.append(f"作者ID: {author}")
         lines.append(f"更新时间: {self._format_time(ts)}")
+        if summary:
+            # 摘要来自接口 description，可能含换行；压成单行以保持卡片字段整齐
+            lines.append(f"摘要: {' '.join(summary.split())}")
         lines.append(f"改动: {change_text or '暂无'}")
         return "\n".join(lines)
 
@@ -2327,6 +2360,13 @@ class SteamUpdatePush(Star):
             return ""
         m = re.search(r"作者ID:\s*(.+)", contents)
         return m.group(1).strip() if m else ""
+
+    @staticmethod
+    def _workshop_summary_from_contents(contents: str) -> str:
+        for line in str(contents or "").splitlines():
+            if line.startswith("摘要:"):
+                return line.split(":", 1)[1].strip()
+        return ""
 
     async def _fetch_workshop_changelog_meta(self, workshop_id: str) -> tuple[str, str]:
         if not self._client or not workshop_id:
@@ -2426,17 +2466,11 @@ class SteamUpdatePush(Star):
         if final_url and "filedetails/?id=" in final_url:
             item_url = final_url.split("&", 1)[0]
 
-        content_lines = [f"ID: {workshop_id}"]
-        if author:
-            content_lines.append(f"作者ID: {author}")
-        content_lines.append(f"更新时间: {self._format_time(ts)}")
-        content_lines.append(f"摘要: {summary or '暂无'}")
-
         return NewsItem(
             gid=f"{workshop_id}:{ts}",
             title=title,
             url=item_url,
-            contents=self._build_workshop_content(workshop_id, author, ts, ""),
+            contents=self._build_workshop_content(workshop_id, author, ts, "", summary),
             date=ts,
             appid=appid,
             image_url=image_url,
@@ -2498,18 +2532,16 @@ class SteamUpdatePush(Star):
             or ""
         ).strip()
         author = str(item.get("creator") or "").strip()
-        summary_raw = str(item.get("file_description") or "").strip()
+        # ISteamRemoteStorage 返回 description，IPublishedFileService 返回 file_description
+        summary_raw = str(
+            item.get("file_description") or item.get("description") or ""
+        ).strip()
         summary = self._summarize_text(summary_raw, 180) if summary_raw else ""
-        content_lines = [f"ID: {workshop_id}"]
-        if author:
-            content_lines.append(f"作者ID: {author}")
-        content_lines.append(f"更新时间: {self._format_time(ts)}")
-        content_lines.append(f"摘要: {summary or '暂无'}")
         return NewsItem(
             gid=f"{workshop_id}:{ts}",
             title=title,
             url=url,
-            contents=self._build_workshop_content(workshop_id, author, ts, ""),
+            contents=self._build_workshop_content(workshop_id, author, ts, "", summary),
             date=ts,
             appid=appid,
             image_url=preview_url,
@@ -2562,7 +2594,10 @@ class SteamUpdatePush(Star):
                 else:
                     # URL path: use the author id shown in URL/page.
                     author = url_author or self._extract_workshop_author_from_contents(news.contents)
-                news.contents = self._build_workshop_content(workshop_id, author, news.date, change_note)
+                summary = self._workshop_summary_from_contents(news.contents)
+                news.contents = self._build_workshop_content(
+                    workshop_id, author, news.date, change_note, summary
+                )
                 items.append(news)
             else:
                 self._log_warn("workshop", "skip item after api+url miss", workshop_id=workshop_id)
@@ -2657,14 +2692,16 @@ class SteamUpdatePush(Star):
 
         items = data.get("appnews", {}).get("newsitems", []) or []
         results: list[NewsItem] = []
-        skipped_external = 0
+        skipped_third_party = 0
         for item in items:
             url = str(item.get("url", ""))
-            if self._is_external_news(
-                url,
-                bool(item.get("is_external_url", False)),
+            if not self._is_official_news_source(
+                feedname=str(item.get("feedname", "")),
+                feedlabel=str(item.get("feedlabel", "")),
+                feed_type=item.get("feed_type"),
+                url=url,
             ):
-                skipped_external += 1
+                skipped_third_party += 1
                 continue
             contents = str(item.get("contents", ""))
             image_candidates = self._extract_news_image_candidates(contents)
@@ -2686,7 +2723,7 @@ class SteamUpdatePush(Star):
             appid=appid,
             status=resp.status_code,
             item_count=len(results),
-            skipped_external=skipped_external,
+            skipped_third_party=skipped_third_party,
             has_key=has_key,
         )
         return results
@@ -2712,11 +2749,50 @@ class SteamUpdatePush(Star):
         return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:20]
 
     @staticmethod
-    def _is_external_news(url: str, is_external_url: bool = False) -> bool:
-        if is_external_url:
+    def _feed_slug_from_url(url: str) -> str:
+        """从 /news/externalpost/<slug>/<id> 形式的链接中取出发布渠道名。"""
+        path = unquote(urlparse(str(url or "")).path)
+        index = path.lower().find(EXTERNAL_NEWS_PATH_MARKER)
+        if index < 0:
+            return ""
+        rest = path[index + len(EXTERNAL_NEWS_PATH_MARKER) :]
+        return rest.split("/", 1)[0].strip()
+
+    @staticmethod
+    def _is_official_feed_name(name: str) -> bool:
+        value = str(name or "").strip().casefold()
+        if not value:
+            return False
+        return value in OFFICIAL_NEWS_FEEDS or value.endswith(OFFICIAL_NEWS_FEED_SUFFIX)
+
+    @classmethod
+    def _is_official_news_source(
+        cls,
+        feedname: str = "",
+        feedlabel: str = "",
+        feed_type: Any = None,
+        url: str = "",
+    ) -> bool:
+        """判断一条新闻是否来自 Steam 官方发布渠道。
+
+        Steam 现在会把几乎所有新闻（包括开发者自己发布的公告）的 url 都指向
+        steamstore-a.akamaihd.net/news/externalpost/...，并将 is_external_url
+        置为 true，因此该字段不再能区分第三方转载，只能按发布渠道判定。
+        完全拿不到来源信息时返回 True（宁可多推，也不要整批漏推）。
+        """
+        if str(feed_type) == "1":
             return True
-        path = urlparse(str(url or "")).path.lower().rstrip("/")
-        return "/news/externalpost/" in f"{path}/"
+        if str(feedlabel or "").strip().casefold() == OFFICIAL_NEWS_LABEL.casefold():
+            return True
+        if cls._is_official_feed_name(feedname):
+            return True
+        slug = cls._feed_slug_from_url(url)
+        if cls._is_official_feed_name(slug):
+            return True
+        # 有来源信息但都不在官方渠道内 -> 第三方媒体转载
+        if str(feedname or "").strip() or slug:
+            return False
+        return True
 
     @staticmethod
     def _parse_feed_pub_ts(pub_date: str) -> int:
@@ -2774,14 +2850,14 @@ class SteamUpdatePush(Star):
         items = root.findall(".//item")
         max_count = max(1, count)
         results: list[NewsItem] = []
-        skipped_external = 0
+        skipped_third_party = 0
         for item in items:
             if len(results) >= max_count:
                 break
             title = (item.findtext("title") or "").strip()
             link = (item.findtext("link") or "").strip()
-            if self._is_external_news(link):
-                skipped_external += 1
+            if not self._is_official_news_source(url=link):
+                skipped_third_party += 1
                 continue
             pub_date = (item.findtext("pubDate") or "").strip()
             desc = (item.findtext("description") or "").strip()
@@ -2806,7 +2882,7 @@ class SteamUpdatePush(Star):
             appid=appid,
             status=resp.status_code,
             item_count=len(results),
-            skipped_external=skipped_external,
+            skipped_third_party=skipped_third_party,
         )
         return results
 

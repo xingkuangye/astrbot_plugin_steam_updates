@@ -2,6 +2,13 @@
 
 本文档记录 `astrbot_plugin_steam_updates` 的版本变更
 
+## 未发布 | Unreleased
+
+### 修复
+- 游戏公告过滤：Steam 现在会把包括开发者公告在内的几乎所有新闻都标记为 `is_external_url=true`，旧逻辑按该字段过滤会导致官方公告被整批丢弃（实测 CS2/Dota2 最近 50 条公告存活数为 0）。改为按发布渠道（`feed_type` / `feedname` / `feedlabel` / 链接中的 `externalpost` 来源名）判定，无法判定时保留
+- 创意工坊摘要：`ISteamRemoteStorage/GetPublishedFileDetails` 返回的字段名是 `description`，旧代码读取的 `file_description` 不存在，导致摘要恒为空；同时该摘要此前只写进了一个未被使用的局部变量，现在会真正渲染进卡片
+- 限时免费活动：GamerPower 用 `end_date="N/A"` 表示没有明确截止时间的长期活动，旧逻辑将其解析为 0 并判定为已失效而丢弃；现在按接口 `status` 判定，并在卡片上显示为“长期有效”
+
 ## v1.3.6
 
 > [!IMPORTANT]
