@@ -4,7 +4,13 @@
 
 ## 未发布 | Unreleased
 
+### 新增
+- 合并转发推送：新增 `forward_message_enable`，开启后更新以 OneBot v11 合并转发（`send_group_forward_msg` / `send_private_forward_msg`）推送。第 1 个节点是概览（发布时间、查询时间、各分区条数），之后每个游戏 / 创意工坊 / 限时免费分区各占一个节点，节点昵称使用分区标题
+- 新增 `forward_node_include_image`：控制合并转发的节点是否附带该分区的首张可用图片（默认开启）
+- 适配 SnowLuma：确认其 `send_group_forward_msg` / `send_private_forward_msg` 接受 AstrBot 生成的标准 node 结构（`{"type":"node","data":{"user_id","nickname","content"}}`），且协议端对 `user_id=0` 会回落到机器人自身 uin。非 OneBot v11 平台（telegram / discord / QQ 官方 API 等）自动回退为普通卡片或文本，合并转发被拒绝时也会自动补发普通消息
+
 ### 修复
+- HTTP 客户端初始化竞态：`_fetch_news` 在客户端尚未建立时直接返回空列表，且并发的 `_ensure_http_client` 会各自新建客户端并 `aclose` 掉对方的在途请求。现在 `_fetch_news` 自行确保客户端就绪，客户端创建改为加锁的双重检查
 - 游戏公告过滤：Steam 现在会把包括开发者公告在内的几乎所有新闻都标记为 `is_external_url=true`，旧逻辑按该字段过滤会导致官方公告被整批丢弃（实测 CS2/Dota2 最近 50 条公告存活数为 0）。改为按发布渠道（`feed_type` / `feedname` / `feedlabel` / 链接中的 `externalpost` 来源名）判定，无法判定时保留
 - 创意工坊摘要：`ISteamRemoteStorage/GetPublishedFileDetails` 返回的字段名是 `description`，旧代码读取的 `file_description` 不存在，导致摘要恒为空；同时该摘要此前只写进了一个未被使用的局部变量，现在会真正渲染进卡片
 - 限时免费活动：GamerPower 用 `end_date="N/A"` 表示没有明确截止时间的长期活动，旧逻辑将其解析为 0 并判定为已失效而丢弃；现在按接口 `status` 判定，并在卡片上显示为“长期有效”

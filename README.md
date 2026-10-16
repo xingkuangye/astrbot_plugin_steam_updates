@@ -135,6 +135,8 @@ AstrBot WebUI -> 插件 -> 插件配置
 | notify_group_ids | 推送群号列表 |
 | platform_id | 平台 ID（可选，如 chatbot2） |
 | message_mode | `card` 或 `text` |
+| forward_message_enable | 是否使用合并转发推送（默认关闭）。开启后第 1 个节点是概览，之后每个游戏/创意工坊/限时免费分区各占一个节点；仅 OneBot v11（aiocqhttp）类协议端生效 |
+| forward_node_include_image | 合并转发的节点是否附带该分区首张可用图片（默认开启） |
 | manual_query_game_command | 游戏更新手动查询指令（可配置多个） |
 | manual_query_workshop_command | 创意工坊手动查询指令（可配置多个） |
 | content_process_mode | 内容处理方式：`plugin` / `llm` |
@@ -234,6 +236,24 @@ mixin:
 
 ### 📣 自动推送
 - 开启 `enable_push` 后，插件会自动轮询并向 `notify_umos` 与旧 `notify_group_ids` 的合并目标发送更新。新字段先处理，旧字段随后处理；规范 UMO 相同的目标只发送一次
+
+### 📨 合并转发推送（SnowLuma / NapCat / Lagrange）
+
+开启 `forward_message_enable` 后，更新会以 OneBot v11 合并转发（`send_group_forward_msg` / `send_private_forward_msg`）推送，结构如下：
+
+```text
+合并转发
+├ 节点 1  昵称 "Steam 更新推送"   更新日志 / 发布时间 / 查询时间 / 各分区条数
+├ 节点 2  昵称 "反恐精英2"        该游戏正文 [+ 配图]
+├ 节点 3  昵称 "Dota 2"          该游戏正文 [+ 配图]
+└ 节点 4  昵称 "限时免费领取"      该分区正文
+```
+
+- 每次轮询里，游戏更新批次与创意工坊批次各自发一条合并转发
+- 节点昵称取分区标题（游戏名 / 工坊条目所属游戏 / “限时免费领取”）
+- 只有 **aiocqhttp（OneBot v11）** 适配器支持该接口；telegram、discord、QQ 官方 API 等平台会自动回退为普通卡片或文本
+- 协议端拒绝或超时时，插件会对失败目标自动补发普通卡片/文本，不会丢消息
+- 协议端适配：AstrBot 生成的是标准 OneBot v11 node 结构 `{"type":"node","data":{"user_id","nickname","content"}}`。[SnowLuma](https://snowluma.github.io/zh/docs/api/extended/send_group_forward_msg) 的 `send_group_forward_msg` 接受该结构，并且对 `user_id=0` 会回落到机器人自身 uin，因此无需额外配置
 
 - 若同时开启 `workshop_enable` 并配置 `workshop_item_ids`，会在同一轮询中检测创意工坊条目更新时间并合并推送
 

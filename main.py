@@ -29,7 +29,7 @@ from astrbot.api import logger
 from astrbot.api.event import filter
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.config.astrbot_config import AstrBotConfig
-from astrbot.core.message.components import Image, Plain
+from astrbot.core.message.components import Image, Node, Nodes, Plain
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.message_session import MessageSession
@@ -62,6 +62,8 @@ OFFICIAL_NEWS_FEED_SUFFIX = "_blog"
 OFFICIAL_NEWS_LABEL = "Community Announcements"
 # 第三方媒体转载在 URL 中的路径标记
 EXTERNAL_NEWS_PATH_MARKER = "/news/externalpost/"
+# 合并转发中概览节点的发送者昵称
+FORWARD_SENDER_NAME = "Steam 更新推送"
 MAX_NEWS_IMAGE_BYTES = 4_000_000
 MAX_NEWS_IMAGE_PIXELS = 3_500_000
 MAX_NEWS_IMAGE_CACHE_FILES = 400
@@ -142,6 +144,7 @@ class SteamUpdatePush(Star):
 
         self._client: httpx.AsyncClient | None = None
         self._client_signature: str = ""
+        self._client_lock: asyncio.Lock | None = None
         self._news_query_semaphore: asyncio.Semaphore | None = None
         self._news_query_semaphore_limit: int | None = None
         self._poll_task: asyncio.Task | None = None
@@ -552,13 +555,23 @@ class SteamUpdatePush(Star):
     def _http_client_signature(self) -> str:
         return f"{self._proxy_mode()}|{self._proxy_url()}"
 
+    def _get_client_lock(self) -> asyncio.Lock:
+        if self._client_lock is None:
+            self._client_lock = asyncio.Lock()
+        return self._client_lock
+
     async def _ensure_http_client(self) -> None:
         signature = self._http_client_signature()
         if self._client is not None and self._client_signature == signature:
             return
-        old_client = self._client
-        self._client = self._build_http_client()
-        self._client_signature = signature
+        # 并发首查时多个协程会同时走到这里；不加锁就会各自新建客户端，
+        # 后建的把先建的 aclose 掉，导致在途请求失败。
+        async with self._get_client_lock():
+            if self._client is not None and self._client_signature == signature:
+                return
+            old_client = self._client
+            self._client = self._build_http_client()
+            self._client_signature = signature
         if old_client is not None:
             try:
                 await old_client.aclose()
@@ -771,6 +784,12 @@ class SteamUpdatePush(Star):
 
     def _enable_app_headers(self) -> bool:
         return bool(self._cfg("enable_app_headers", True))
+
+    def _forward_message_enabled(self) -> bool:
+        return bool(self._cfg("forward_message_enable", False))
+
+    def _forward_node_include_image(self) -> bool:
+        return bool(self._cfg("forward_node_include_image", True))
 
     def _failed_download_cooldown_sec(self) -> int:
         try:
@@ -1257,12 +1276,39 @@ class SteamUpdatePush(Star):
         card_kind: str,
         mode: str,
     ) -> PushResult:
+        # 合并转发优先；发送失败的目标回退到普通卡片/文本
+        forwarded: list[NotifyTarget] = []
+        if sections and self._forward_message_enabled():
+            forward_targets = [
+                target for target in targets if self._target_supports_forward(target)
+            ]
+            if forward_targets:
+                forward_result = await self._push_forward(
+                    forward_targets,
+                    sections,
+                    publish_text,
+                    query_text,
+                    card_kind,
+                )
+                forwarded = forward_result.succeeded
+                targets = forward_result.failed
+                if targets:
+                    self._log_warn(
+                        "push",
+                        "forward send failed, fallback to normal message",
+                        card_kind=card_kind,
+                        failed_count=len(targets),
+                    )
+            if not targets:
+                return PushResult(forwarded, [])
+
         if mode == "text":
             text = self._build_text_message(
                 sections,
                 publish_text,
             )
-            return await self._push_text(targets, text)
+            result = await self._push_text(targets, text)
+            return PushResult(forwarded + result.succeeded, result.failed)
 
         image_bytes = await self._render_card(
             sections,
@@ -1275,14 +1321,15 @@ class SteamUpdatePush(Star):
                 sections,
                 publish_text,
             )
-            return await self._push_text(targets, text)
+            result = await self._push_text(targets, text)
+            return PushResult(forwarded + result.succeeded, result.failed)
 
         image_result = await self._push_image(
             targets,
             image_bytes,
         )
         if not image_result.failed:
-            return image_result
+            return PushResult(forwarded + image_result.succeeded, [])
 
         self._log_warn(
             "poll",
@@ -1298,18 +1345,9 @@ class SteamUpdatePush(Star):
             image_result.failed,
             text,
         )
-        succeeded_targets = set(image_result.succeeded)
-        succeeded_targets.update(text_result.succeeded)
-        failed_targets = set(text_result.failed)
         return PushResult(
-            succeeded=[
-                target for target in targets
-                if target in succeeded_targets
-            ],
-            failed=[
-                target for target in targets
-                if target in failed_targets
-            ],
+            forwarded + image_result.succeeded + text_result.succeeded,
+            list(text_result.failed),
         )
 
     async def _manual_query(self, umo: str | None = None, query_kind: str = "all"):
@@ -1990,6 +2028,7 @@ class SteamUpdatePush(Star):
         return [free_section] if free_only_when_no_news else []
 
     async def _fetch_news(self, appid: str, count: int, only_today: bool = True) -> list[NewsItem]:
+        await self._ensure_http_client()
         if not self._client:
             self._log_warn("fetch", "http client not ready", appid=appid)
             return []
@@ -3581,6 +3620,32 @@ class SteamUpdatePush(Star):
             self._debug("llm failed, fallback to plugin mode")
         return await self._build_sections_native(appids, updates_by_app)
 
+    def _section_body_lines(self, section: AppSection, max_chars: int) -> list[str]:
+        """渲染单个分区的正文行；文本推送与合并转发节点共用同一份内容。"""
+        is_free_games_sec = str(section.appid).strip().lower() == "free_games"
+        lines: list[str] = []
+        if not section.updates:
+            lines.append("暂无更新")
+            lines.append("")
+            return lines
+        for item in section.updates:
+            if item.title:
+                lines.append(f"- {item.title}")
+            if is_free_games_sec:
+                summary = self._summarize_free_game_text(item.contents, max_chars)
+            else:
+                summary = self._summarize_text(item.contents, max_chars)
+            if summary:
+                lines.append(summary)
+            if not is_free_games_sec:
+                date_text = self._format_time(item.date)
+                if date_text:
+                    lines.append(f"发布于：{date_text}")
+                if item.url:
+                    lines.append(f"链接：{item.url}")
+            lines.append("")
+        return lines
+
     def _build_text_message(
         self, sections: list[AppSection], publish_text: str, notice: str = ""
     ) -> str:
@@ -3593,29 +3658,91 @@ class SteamUpdatePush(Star):
         lines.append("")
         max_chars = int(self._cfg("content_max_chars", 800))
         for sec in sections:
-            is_free_games_sec = str(sec.appid).strip().lower() == "free_games"
             lines.append(f"【{sec.title}】")
-            if not sec.updates:
-                lines.append("暂无更新")
-                lines.append("")
-                continue
-            for item in sec.updates:
-                if item.title:
-                    lines.append(f"- {item.title}")
-                if is_free_games_sec:
-                    summary = self._summarize_free_game_text(item.contents, max_chars)
-                else:
-                    summary = self._summarize_text(item.contents, max_chars)
-                if summary:
-                    lines.append(summary)
-                if not is_free_games_sec:
-                    date_text = self._format_time(item.date)
-                    if date_text:
-                        lines.append(f"发布于：{date_text}")
-                    if item.url:
-                        lines.append(f"链接：{item.url}")
-                lines.append("")
+            lines.extend(self._section_body_lines(sec, max_chars))
         return "\n".join(lines).strip()
+
+    # --- merge forward (OneBot v11) ---
+    async def _forward_node_image_path(
+        self,
+        section: AppSection,
+        image_map: dict[str, PilImage.Image],
+    ) -> str:
+        if not image_map:
+            return ""
+        image: PilImage.Image | None = None
+        for item in section.updates:
+            image = self._first_prefetched_item_image(item, image_map)
+            if image is not None:
+                break
+        if image is None:
+            return ""
+        try:
+            buffer = BytesIO()
+            image.convert("RGB").save(buffer, format="PNG")
+            return self._save_temp_image(buffer.getvalue()) or ""
+        except Exception as exc:
+            self._log_debug("push", "forward node image failed", error=self._exc_text(exc))
+            return ""
+
+    async def _build_forward_chain(
+        self,
+        sections: list[AppSection],
+        publish_text: str,
+        query_text: str,
+        card_kind: str = "game",
+    ) -> MessageChain | None:
+        """把一个批次渲染成 OneBot v11 合并转发（一个分区一个节点）。"""
+        if not sections:
+            return None
+        max_chars = int(self._cfg("content_max_chars", 800))
+        image_map: dict[str, PilImage.Image] = {}
+        if self._forward_node_include_image():
+            try:
+                image_map = await self._prefetch_images(sections, set())
+            except Exception as exc:
+                self._log_warn(
+                    "push",
+                    "forward image prefetch failed",
+                    error=self._exc_text(exc),
+                )
+                image_map = {}
+
+        is_workshop_only = all(str(sec.appid).startswith("workshop") for sec in sections)
+        header_lines = [
+            "创意工坊更新日志" if is_workshop_only else "更新日志",
+            f"发布时间：{publish_text}",
+            f"查询时间：{query_text}",
+            "",
+        ]
+        header_lines.extend(
+            f"· {str(sec.title or '').strip() or sec.appid}（{len(sec.updates)} 条）"
+            for sec in sections
+        )
+        nodes: list[Node] = [
+            Node(
+                content=[Plain("\n".join(header_lines).strip())],
+                name=FORWARD_SENDER_NAME,
+                uin="0",
+            )
+        ]
+        for sec in sections:
+            body = "\n".join(self._section_body_lines(sec, max_chars)).strip() or "暂无更新"
+            node_content: list[Any] = [Plain(body)]
+            image_path = await self._forward_node_image_path(sec, image_map)
+            if image_path:
+                node_content.append(Image(file=image_path))
+            node_name = str(sec.title or "").strip() or FORWARD_SENDER_NAME
+            nodes.append(Node(content=node_content, name=node_name, uin="0"))
+
+        self._log_debug(
+            "push",
+            "forward chain built",
+            card_kind=card_kind,
+            node_count=len(nodes),
+            image_count=len(image_map),
+        )
+        return MessageChain(chain=[Nodes(nodes)])
 
     # --- render card ---
     async def _render_card(
@@ -4609,6 +4736,47 @@ class SteamUpdatePush(Star):
         return ImageFont.load_default()
 
     # --- send ---
+    def _target_supports_forward(self, target: NotifyTarget) -> bool:
+        """合并转发依赖 OneBot v11 的 send_group_forward_msg / send_private_forward_msg。
+
+        SnowLuma / NapCat / Lagrange 等协议端都实现了这两个 action；其他平台
+        （telegram、discord、QQ 官方 API 等）只能回退到普通消息。
+        """
+        platform_id = str(target.platform_id or "").strip()
+        if not platform_id:
+            return False
+        try:
+            platform_insts = self.context.platform_manager.platform_insts
+        except Exception:
+            return False
+        for platform in platform_insts:
+            try:
+                meta = platform.meta()
+            except Exception:
+                continue
+            if str(getattr(meta, "id", "") or "") != platform_id:
+                continue
+            return str(getattr(meta, "name", "") or "") == "aiocqhttp"
+        return False
+
+    async def _push_forward(
+        self,
+        targets: list[NotifyTarget],
+        sections: list[AppSection],
+        publish_text: str,
+        query_text: str,
+        card_kind: str,
+    ) -> PushResult:
+        chain = await self._build_forward_chain(
+            sections,
+            publish_text,
+            query_text,
+            card_kind,
+        )
+        if chain is None:
+            return PushResult([], list(targets))
+        return await self._push_chain(targets, chain)
+
     async def _push_text(
         self,
         targets: list[NotifyTarget],
